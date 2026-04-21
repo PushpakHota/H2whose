@@ -1,11 +1,83 @@
-import { useState, useEffect, useRef } from "react";
-import { Plus, RotateCcw, X, ChevronDown, Eraser } from "lucide-react";
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import {
+  Plus,
+  RotateCcw,
+  X,
+  ChevronDown,
+  Eraser,
+  Volume2,
+  VolumeX,
+} from "lucide-react";
+import * as sfx from "./sounds.js";
+import { fireConfetti } from "./confetti.js";
+
+// ─── Room handling (via URL hash, e.g. #finance, #team-a) ─────────
+const getRoom = () => {
+  if (typeof window === "undefined") return "default";
+  const h = window.location.hash
+    .replace("#", "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "")
+    .slice(0, 40);
+  return h || "default";
+};
+
+// ─── localStorage fallback (per-room, with migration from old keys) ──
+const lsKey = (room) => `h2w:state:${room}`;
+const emptyState = () => ({
+  names: [],
+  currentRound: [],
+  history: [],
+  roundNumber: 1,
+  updatedAt: 0,
+});
+
+const lsRead = (room) => {
+  try {
+    const raw = localStorage.getItem(lsKey(room));
+    if (raw) return JSON.parse(raw);
+    // Migrate legacy un-roomed keys → default room.
+    if (room === "default") {
+      const names = JSON.parse(localStorage.getItem("h2w:names") || "null");
+      const currentRound = JSON.parse(localStorage.getItem("h2w:round") || "null");
+      const history = JSON.parse(localStorage.getItem("h2w:log") || "null");
+      const roundNumber = JSON.parse(localStorage.getItem("h2w:roundnum") || "null");
+      if (names || currentRound || history || roundNumber) {
+        return {
+          names: names || [],
+          currentRound: currentRound || [],
+          history: history || [],
+          roundNumber: roundNumber || 1,
+          updatedAt: 0,
+        };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+const lsWrite = (room, state) => {
+  try {
+    localStorage.setItem(lsKey(room), JSON.stringify(state));
+  } catch {}
+};
+
+const MUTE_KEY = "h2w:muted";
 
 export default function App() {
+  const room = useMemo(getRoom, []);
+  const apiUrl = `/api/state?room=${encodeURIComponent(room)}`;
+
+  // ─── Shared state (mirrored to Redis + localStorage) ──────────
   const [names, setNames] = useState([]);
   const [currentRound, setCurrentRound] = useState([]);
   const [history, setHistory] = useState([]);
   const [roundNumber, setRoundNumber] = useState(1);
+  const [updatedAt, setUpdatedAt] = useState(0);
+
+  // ─── UI-only state ────────────────────────────────────────────
   const [newName, setNewName] = useState("");
   const [isSpinning, setIsSpinning] = useState(false);
   const [spinDisplay, setSpinDisplay] = useState("");
@@ -15,49 +87,151 @@ export default function App() {
   const [justCompletedRound, setJustCompletedRound] = useState(false);
   const [revealKey, setRevealKey] = useState(0);
   const [confirmClearLog, setConfirmClearLog] = useState(false);
-  const spinIntervalRef = useRef(null);
-
-  // ─── localStorage helpers ────────────────────────────────
-  const readKey = (key) => {
+  const [syncStatus, setSyncStatus] = useState("loading"); // loading | online | offline
+  const [muted, setMuted] = useState(() => {
     try {
-      const v = localStorage.getItem(key);
-      return v ? JSON.parse(v) : null;
+      return localStorage.getItem(MUTE_KEY) === "1";
     } catch {
-      return null;
+      return false;
     }
-  };
-  const writeKey = (key, val) => {
-    try {
-      localStorage.setItem(key, JSON.stringify(val));
-    } catch (e) {
-      console.error("storage write failed", e);
-    }
-  };
+  });
 
-  // Hydrate on mount
+  const spinTimeoutRef = useRef(null);
+  const updatedAtRef = useRef(0);
+
+  // Keep a ref in sync so the polling loop sees the latest updatedAt
+  // without re-creating its interval on every change.
   useEffect(() => {
-    const n = readKey("h2w:names");
-    const r = readKey("h2w:round");
-    const h = readKey("h2w:log");
-    const rn = readKey("h2w:roundnum");
-    if (n) setNames(n);
-    if (r) setCurrentRound(r);
-    if (h) setHistory(h);
-    if (rn) setRoundNumber(rn);
-    setLoading(false);
-    return () => {
-      if (spinIntervalRef.current) clearInterval(spinIntervalRef.current);
-    };
+    updatedAtRef.current = updatedAt;
+  }, [updatedAt]);
+
+  // ─── Sound wrapper respects the mute toggle ────────────────────
+  const play = useCallback(
+    (fn) => {
+      if (muted) return;
+      try {
+        fn();
+      } catch {}
+    },
+    [muted]
+  );
+
+  // ─── Apply a state snapshot to React state ─────────────────────
+  const applyState = useCallback((s) => {
+    if (!s) return;
+    setNames(s.names || []);
+    setCurrentRound(s.currentRound || []);
+    setHistory(s.history || []);
+    setRoundNumber(s.roundNumber || 1);
+    setUpdatedAt(s.updatedAt || 0);
   }, []);
 
+  // ─── Persist: save locally first (instant), then push to server ─
+  const persist = useCallback(
+    async (partial) => {
+      const next = {
+        names: partial.names ?? names,
+        currentRound: partial.currentRound ?? currentRound,
+        history: partial.history ?? history,
+        roundNumber: partial.roundNumber ?? roundNumber,
+        updatedAt: Date.now(),
+      };
+      setUpdatedAt(next.updatedAt);
+      lsWrite(room, next);
+
+      try {
+        const res = await fetch(apiUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(next),
+        });
+        setSyncStatus(res.ok ? "online" : "offline");
+      } catch {
+        setSyncStatus("offline");
+      }
+    },
+    [apiUrl, room, names, currentRound, history, roundNumber]
+  );
+
+  // ─── Initial hydration: merge local + remote, preferring newer ─
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      const local = lsRead(room);
+      try {
+        const res = await fetch(apiUrl, { cache: "no-store" });
+        if (!res.ok) throw new Error(`status ${res.status}`);
+        const server = await res.json();
+        if (!mounted) return;
+        setSyncStatus("online");
+
+        const localNewer =
+          local &&
+          (local.updatedAt || 0) > (server.updatedAt || 0) &&
+          (local.names?.length || local.history?.length);
+
+        if (localNewer) {
+          // Push local-only changes up.
+          applyState(local);
+          fetch(apiUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(local),
+          }).catch(() => {});
+        } else {
+          applyState(server);
+          lsWrite(room, server);
+        }
+      } catch {
+        if (!mounted) return;
+        setSyncStatus("offline");
+        if (local) applyState(local);
+      }
+      if (mounted) setLoading(false);
+    })();
+
+    return () => {
+      mounted = false;
+      if (spinTimeoutRef.current) clearTimeout(spinTimeoutRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [room]);
+
+  // ─── Polling: pull fresh state every 5s (paused while spinning / hidden) ──
+  useEffect(() => {
+    const tick = async () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      if (isSpinning) return;
+      try {
+        const res = await fetch(apiUrl, { cache: "no-store" });
+        if (!res.ok) {
+          setSyncStatus("offline");
+          return;
+        }
+        const data = await res.json();
+        setSyncStatus("online");
+        if (data && (data.updatedAt || 0) > updatedAtRef.current) {
+          applyState(data);
+          lsWrite(room, data);
+        }
+      } catch {
+        setSyncStatus("offline");
+      }
+    };
+    const id = setInterval(tick, 5000);
+    return () => clearInterval(id);
+  }, [apiUrl, isSpinning, room, applyState]);
+
+  // ─── Mutations ─────────────────────────────────────────────────
   const addName = () => {
+    if (isSpinning) return;
     const trimmed = newName.trim();
     if (!trimmed) return;
     if (names.some((n) => n.name.toLowerCase() === trimmed.toLowerCase())) {
       setNewName("");
       return;
     }
-    const next = [
+    const nextNames = [
       ...names,
       {
         id:
@@ -68,34 +242,39 @@ export default function App() {
         active: true,
       },
     ];
-    setNames(next);
-    writeKey("h2w:names", next);
+    setNames(nextNames);
     setNewName("");
+    play(sfx.addPop);
+    persist({ names: nextNames });
   };
 
   const removeName = (id) => {
-    const next = names.filter((n) => n.id !== id);
-    setNames(next);
-    writeKey("h2w:names", next);
-    if (currentRound.includes(id)) {
-      const nextRound = currentRound.filter((rid) => rid !== id);
-      setCurrentRound(nextRound);
-      writeKey("h2w:round", nextRound);
-    }
+    if (isSpinning) return;
+    const nextNames = names.filter((n) => n.id !== id);
+    const nextRound = currentRound.includes(id)
+      ? currentRound.filter((r) => r !== id)
+      : currentRound;
+    setNames(nextNames);
+    setCurrentRound(nextRound);
+    play(sfx.click);
+    persist({ names: nextNames, currentRound: nextRound });
   };
 
   const toggleActive = (id) => {
-    const next = names.map((n) =>
+    if (isSpinning) return;
+    const nextNames = names.map((n) =>
       n.id === id ? { ...n, active: !n.active } : n
     );
-    setNames(next);
-    writeKey("h2w:names", next);
+    setNames(nextNames);
+    play(sfx.click);
+    persist({ names: nextNames });
   };
 
   const activeNames = names.filter((n) => n.active);
   const filledInRound = activeNames.filter((n) => currentRound.includes(n.id));
   const canPick = activeNames.length > 0 && !isSpinning;
 
+  // ─── The main event: decelerating roulette spin ────────────────
   const pick = () => {
     if (!canPick) return;
 
@@ -117,63 +296,94 @@ export default function App() {
     setPickedName(null);
     setJustCompletedRound(false);
 
-    let tick = 0;
-    const totalTicks = 22;
+    if (startedNewRound) play(sfx.splash);
+
+    const totalTicks = 28;
+    const startDelay = 45;
+    const endDelay = 340;
     const pool = activeNames.length > 1 ? activeNames : [winner];
+    let t = 0;
 
-    spinIntervalRef.current = setInterval(() => {
-      const shown = pool[Math.floor(Math.random() * pool.length)];
-      setSpinDisplay(shown.name);
-      tick += 1;
-
-      if (tick >= totalTicks) {
-        clearInterval(spinIntervalRef.current);
-        spinIntervalRef.current = null;
-        setSpinDisplay(winner.name);
-        setPickedName(winner);
-        setIsSpinning(false);
-        setRevealKey((k) => k + 1);
-
-        const nextRound = [...roundState, winner.id];
-        setCurrentRound(nextRound);
-        writeKey("h2w:round", nextRound);
-
-        if (startedNewRound) {
-          setRoundNumber(roundNum);
-          writeKey("h2w:roundnum", roundNum);
-        }
-
-        const entry = {
-          name: winner.name,
-          timestamp: new Date().toISOString(),
-          round: roundNum,
-        };
-        const nextLog = [entry, ...history].slice(0, 300);
-        setHistory(nextLog);
-        writeKey("h2w:log", nextLog);
-
-        if (nextRound.length >= activeNames.length) {
-          setJustCompletedRound(true);
-        }
+    const doTick = () => {
+      if (t < totalTicks) {
+        const shown = pool[Math.floor(Math.random() * pool.length)];
+        setSpinDisplay(shown.name);
+        play(sfx.tick);
+        t += 1;
+        // Ease-out cubic — slows dramatically near the end.
+        const pct = t / totalTicks;
+        const delay = startDelay + (endDelay - startDelay) * Math.pow(pct, 2.2);
+        spinTimeoutRef.current = setTimeout(doTick, delay);
+        return;
       }
-    }, 75);
+
+      // ── Finale ──
+      setSpinDisplay(winner.name);
+      setPickedName(winner);
+      setIsSpinning(false);
+      setRevealKey((k) => k + 1);
+      play(sfx.winFanfare);
+      fireConfetti();
+
+      const nextRound = [...roundState, winner.id];
+      setCurrentRound(nextRound);
+      if (startedNewRound) setRoundNumber(roundNum);
+
+      const entry = {
+        name: winner.name,
+        timestamp: new Date().toISOString(),
+        round: roundNum,
+      };
+      const nextLog = [entry, ...history].slice(0, 300);
+      setHistory(nextLog);
+
+      if (nextRound.length >= activeNames.length) {
+        setJustCompletedRound(true);
+      }
+
+      persist({
+        currentRound: nextRound,
+        history: nextLog,
+        roundNumber: roundNum,
+      });
+    };
+
+    spinTimeoutRef.current = setTimeout(doTick, 80);
   };
 
   const resetRound = () => {
-    setCurrentRound([]);
-    writeKey("h2w:round", []);
+    if (isSpinning) return;
     const next = roundNumber + 1;
+    setCurrentRound([]);
     setRoundNumber(next);
-    writeKey("h2w:roundnum", next);
     setPickedName(null);
     setJustCompletedRound(false);
     setSpinDisplay("");
+    play(sfx.whoosh);
+    persist({ currentRound: [], roundNumber: next });
   };
 
   const clearLog = () => {
     setHistory([]);
-    writeKey("h2w:log", []);
     setConfirmClearLog(false);
+    play(sfx.whoosh);
+    persist({ history: [] });
+  };
+
+  const toggleMute = () => {
+    const next = !muted;
+    setMuted(next);
+    try {
+      localStorage.setItem(MUTE_KEY, next ? "1" : "0");
+    } catch {}
+    if (!next) {
+      // Confirm with a click when un-muting.
+      setTimeout(() => {
+        try {
+          sfx.click();
+        } catch {}
+      }, 0);
+    }
   };
 
   const formatTime = (iso) => {
@@ -186,6 +396,21 @@ export default function App() {
     });
   };
 
+  // ─── Hall of Hydration: top 3 fillers by count (all-time in log) ──
+  const topFillers = useMemo(() => {
+    const counts = {};
+    history.forEach((h) => {
+      counts[h.name] = (counts[h.name] || 0) + 1;
+    });
+    return Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3);
+  }, [history]);
+
+  // ─── Back-to-back: same name as the next (older) log entry? ──
+  const isBackToBack = (i) =>
+    i < history.length - 1 && history[i].name === history[i + 1].name;
+
   const bubbles = Array.from({ length: 14 }, (_, i) => {
     const seed = i * 37.7;
     return {
@@ -196,6 +421,17 @@ export default function App() {
       drift: ((seed * 4.4) % 80) - 40 + "px",
     };
   });
+
+  const syncDotColor = {
+    online: "var(--mint-deep)",
+    offline: "var(--coral)",
+    loading: "var(--sun)",
+  }[syncStatus];
+  const syncLabel = {
+    online: "synced",
+    offline: "offline",
+    loading: "syncing…",
+  }[syncStatus];
 
   return (
     <div className="app-root">
@@ -267,10 +503,62 @@ export default function App() {
           0%, 100% { transform: translateY(0) rotate(0); }
           50% { transform: translateY(-4px) rotate(-3deg); }
         }
+        .subtitle-row {
+          display: flex; align-items: center; gap: 10px; margin: 4px 0 0 54px;
+          flex-wrap: wrap;
+        }
         .subtitle {
           font-family: 'Fraunces', serif; font-style: italic; font-weight: 400;
-          font-size: 14px; color: var(--ocean); margin: 4px 0 0 54px;
+          font-size: 14px; color: var(--ocean); margin: 0;
         }
+        .room-tag {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 10.5px; font-weight: 600; letter-spacing: 0.05em;
+          background: var(--mint); color: var(--ocean-deep);
+          padding: 3px 8px; border-radius: 5px;
+          border: 1.5px solid var(--ocean-deep);
+        }
+        .room-tag::before { content: '#'; opacity: 0.55; margin-right: 1px; }
+
+        .header-tools {
+          display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+        }
+        .sync-pill {
+          display: inline-flex; align-items: center; gap: 6px;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 10.5px; font-weight: 600; color: var(--ocean);
+          background: var(--foam); border: 1.5px solid var(--ocean);
+          padding: 5px 9px; border-radius: 999px;
+          letter-spacing: 0.05em;
+        }
+        .sync-dot {
+          width: 7px; height: 7px; border-radius: 50%;
+          box-shadow: 0 0 6px currentColor;
+        }
+        .sync-pill.loading .sync-dot { animation: pulse 1.2s ease infinite; }
+        @keyframes pulse {
+          0%, 100% { opacity: 0.4; }
+          50% { opacity: 1; }
+        }
+
+        .mute-btn {
+          display: inline-flex; align-items: center; justify-content: center;
+          width: 36px; height: 36px; background: var(--foam);
+          border: 2px solid var(--ink); border-radius: 10px;
+          box-shadow: 2px 2px 0 var(--ink); cursor: pointer;
+          color: var(--ocean-deep);
+          transition: transform 120ms ease, box-shadow 120ms ease;
+        }
+        .mute-btn:hover {
+          transform: translate(-1px, -1px);
+          box-shadow: 3px 3px 0 var(--ink);
+        }
+        .mute-btn:active {
+          transform: translate(1px, 1px);
+          box-shadow: 1px 1px 0 var(--ink);
+        }
+        .mute-btn.muted { background: var(--cream-deep); color: var(--coral-deep); }
+
         .round-pill {
           background: var(--ink); color: var(--cream);
           padding: 9px 16px 9px 12px; border-radius: 999px;
@@ -441,6 +729,7 @@ export default function App() {
           transform: translate(-1px, -1px);
           box-shadow: 4px 4px 0 var(--ink);
         }
+        .name-input:disabled { opacity: 0.5; cursor: not-allowed; }
         .add-btn {
           padding: 0 22px; background: var(--sun);
           border: 2.5px solid var(--ink); border-radius: 14px;
@@ -450,14 +739,15 @@ export default function App() {
           color: var(--ink); white-space: nowrap;
           transition: transform 120ms ease, box-shadow 120ms ease;
         }
-        .add-btn:hover {
+        .add-btn:hover:not(:disabled) {
           transform: translate(-1px, -1px);
           box-shadow: 4px 4px 0 var(--ink);
         }
-        .add-btn:active {
+        .add-btn:active:not(:disabled) {
           transform: translate(2px, 2px);
           box-shadow: 1px 1px 0 var(--ink);
         }
+        .add-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
         .crew-grid {
           display: grid;
@@ -493,6 +783,7 @@ export default function App() {
           transition: background 120ms ease;
         }
         .check-btn.checked { background: var(--ocean-deep); }
+        .check-btn:disabled { cursor: not-allowed; opacity: 0.6; }
         .check-btn svg { opacity: 0; transition: opacity 120ms ease; }
         .check-btn.checked svg { opacity: 1; }
 
@@ -515,9 +806,8 @@ export default function App() {
           opacity: 0.5;
           transition: opacity 120ms, background 120ms;
         }
-        .remove-btn:hover {
-          opacity: 1; background: rgba(242,110,87,0.15);
-        }
+        .remove-btn:hover { opacity: 1; background: rgba(242,110,87,0.15); }
+        .remove-btn:disabled { cursor: not-allowed; opacity: 0.25; }
 
         .empty-crew {
           padding: 32px 20px; text-align: center;
@@ -540,6 +830,36 @@ export default function App() {
           color: var(--coral-deep); border-color: var(--coral-deep);
         }
         .ghost-btn.danger:hover { background: rgba(242,110,87,0.12); }
+        .ghost-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        /* ─── Hall of Hydration ───────────────────────────────── */
+        .podium {
+          background: linear-gradient(135deg, var(--foam) 0%, var(--mint) 100%);
+          border: 2px solid var(--ink); border-radius: 14px;
+          padding: 14px 18px; margin-bottom: 18px;
+          box-shadow: 3px 3px 0 var(--ink);
+          display: flex; align-items: center; flex-wrap: wrap; gap: 12px;
+        }
+        .podium-label {
+          font-family: 'Fraunces', serif; font-style: italic;
+          font-weight: 600; font-size: 14px;
+          color: var(--ocean-deep);
+        }
+        .podium-list {
+          display: flex; gap: 10px; flex-wrap: wrap; flex: 1;
+        }
+        .podium-slot {
+          display: inline-flex; align-items: center; gap: 6px;
+          background: var(--foam); border: 1.5px solid var(--ocean-deep);
+          padding: 4px 10px; border-radius: 999px;
+          font-size: 13px; font-weight: 600; color: var(--ink);
+        }
+        .podium-slot .medal { font-size: 15px; }
+        .podium-slot .cnt {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 11px; font-weight: 600;
+          color: var(--coral-deep);
+        }
 
         .log-trigger {
           display: flex; align-items: center; gap: 10px;
@@ -569,7 +889,7 @@ export default function App() {
         }
 
         .log-entry {
-          display: grid; grid-template-columns: 52px 1fr auto;
+          display: grid; grid-template-columns: 52px 1fr auto auto;
           gap: 12px; align-items: center;
           padding: 9px 12px; border-bottom: 1px dashed var(--cream-deep);
         }
@@ -583,6 +903,12 @@ export default function App() {
         .log-name {
           font-family: 'Geist', sans-serif; font-size: 14px;
           font-weight: 500; color: var(--ink);
+        }
+        .log-streak {
+          font-family: 'Fraunces', serif; font-size: 10.5px; font-weight: 600;
+          color: var(--coral-deep); background: rgba(242,110,87,0.15);
+          padding: 2px 7px; border-radius: 5px;
+          letter-spacing: 0.02em; white-space: nowrap;
         }
         .log-time {
           font-family: 'JetBrains Mono', monospace; font-size: 11px;
@@ -621,7 +947,9 @@ export default function App() {
           .log-trigger { font-size: 22px; }
           .add-row { flex-direction: column; }
           .add-btn { width: 100%; justify-content: center; padding: 14px; }
-          .subtitle { margin-left: 0; }
+          .subtitle-row { margin-left: 0; }
+          .log-entry { grid-template-columns: 48px 1fr auto; row-gap: 4px; }
+          .log-time { grid-column: 2 / -1; text-align: right; }
         }
       `}</style>
 
@@ -652,11 +980,40 @@ export default function App() {
                 <em>Whose?</em>
               </span>
             </div>
-            <div className="subtitle">the fairest way to find the next bottle-filler.</div>
+            <div className="subtitle-row">
+              <span className="subtitle">the fairest way to find the next bottle-filler.</span>
+              {room !== "default" && <span className="room-tag">{room}</span>}
+            </div>
           </div>
-          <div className="round-pill">
-            <span className="dot" />
-            Round №{roundNumber}
+
+          <div className="header-tools">
+            <span
+              className={`sync-pill ${syncStatus === "loading" ? "loading" : ""}`}
+              title={
+                syncStatus === "online"
+                  ? "Synced with the crew in real time."
+                  : syncStatus === "offline"
+                  ? "Can't reach the server — changes will sync when back online."
+                  : "Checking in with the server…"
+              }
+            >
+              <span className="sync-dot" style={{ background: syncDotColor, color: syncDotColor }} />
+              {syncLabel}
+            </span>
+
+            <button
+              className={`mute-btn ${muted ? "muted" : ""}`}
+              onClick={toggleMute}
+              aria-label={muted ? "Unmute sound effects" : "Mute sound effects"}
+              title={muted ? "Unmute" : "Mute"}
+            >
+              {muted ? <VolumeX size={18} strokeWidth={2.2} /> : <Volume2 size={18} strokeWidth={2.2} />}
+            </button>
+
+            <div className="round-pill">
+              <span className="dot" />
+              Round №{roundNumber}
+            </div>
           </div>
         </header>
 
@@ -761,8 +1118,13 @@ export default function App() {
               onChange={(e) => setNewName(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && addName()}
               maxLength={40}
+              disabled={isSpinning}
             />
-            <button className="add-btn" onClick={addName}>
+            <button
+              className="add-btn"
+              onClick={addName}
+              disabled={isSpinning || !newName.trim()}
+            >
               <Plus size={16} strokeWidth={2.5} /> add buddy
             </button>
           </div>
@@ -785,6 +1147,7 @@ export default function App() {
                     <button
                       className={`check-btn ${n.active ? "checked" : ""}`}
                       onClick={() => toggleActive(n.id)}
+                      disabled={isSpinning}
                       aria-label={n.active ? `Unselect ${n.name}` : `Select ${n.name}`}
                     >
                       <svg width="14" height="14" viewBox="0 0 14 14" fill="none"
@@ -798,6 +1161,7 @@ export default function App() {
                     <button
                       className="remove-btn"
                       onClick={() => removeName(n.id)}
+                      disabled={isSpinning}
                       aria-label={`Remove ${n.name}`}
                     >
                       <X size={15} strokeWidth={2.2} />
@@ -809,7 +1173,7 @@ export default function App() {
           )}
 
           <div className="actions-row">
-            <button className="ghost-btn" onClick={resetRound}>
+            <button className="ghost-btn" onClick={resetRound} disabled={isSpinning}>
               <RotateCcw size={14} /> start fresh round
             </button>
           </div>
@@ -845,6 +1209,21 @@ export default function App() {
             )}
           </div>
 
+          {showLog && topFillers.length > 0 && (
+            <div className="podium">
+              <span className="podium-label">Hall of Hydration</span>
+              <div className="podium-list">
+                {topFillers.map(([name, count], i) => (
+                  <span key={name} className="podium-slot">
+                    <span className="medal">{["🥇", "🥈", "🥉"][i]}</span>
+                    {name}
+                    <span className="cnt">×{count}</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
           {showLog &&
             (history.length === 0 ? (
               <div className="empty-log">
@@ -856,6 +1235,11 @@ export default function App() {
                   <div className="log-entry" key={i}>
                     <span className="log-round-tag">R{h.round}</span>
                     <span className="log-name">{h.name}</span>
+                    {isBackToBack(i) ? (
+                      <span className="log-streak">🔥 back-to-back</span>
+                    ) : (
+                      <span />
+                    )}
                     <span className="log-time">{formatTime(h.timestamp)}</span>
                   </div>
                 ))}
